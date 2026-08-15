@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -154,5 +157,91 @@ func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		written += n
+	}
+}
+
+type config struct {
+	cluster []goraft.ClusterMember
+	index   int
+	id      string
+	address string
+	http    string
+}
+
+func getConfig() config {
+	cfg := config{}
+	var node string
+	for i, arg := range os.Args[1:] {
+		if arg == "--node" {
+			var err error
+			node = os.Args[i+2]
+			cfg.index, err = strconv.Atoi(node)
+			if err != nil {
+				log.Fatal("Expected $value to be a valid integer in `--node $value`, got: %s", node)
+			}
+			i++
+			continue
+		}
+
+		if arg == "--http" {
+			cfg.http = os.Args[i+2]
+			i++
+			continue
+		}
+
+		if arg == "--cluster" {
+			cluster := os.Args[i+2]
+			var clusterEntry goraft.ClusterMember
+			for _, part := range strings.Split(cluster, ";") {
+				idAddress := strings.Split(part, ",")
+				var err error
+				clusterEntry.Id, err = strconv.ParseUint(idAddress[0], 10, 64)
+				if err != nil {
+					log.Fatal("Expected $id to be a valid integer in `--cluster $id,$ip`, got: %s", idAddress[0])
+				}
+
+				clusterEntry.Address = idAddress[1]
+				cfg.cluster = append(cfg.cluster, clusterEntry)
+			}
+
+			i++
+			continue
+		}
+	}
+
+	if node == "" {
+		log.Fatal("Missing required parameter: --node $index")
+	}
+
+	if cfg.http == "" {
+		log.Fatal("Missing required parameter: --http $address")
+	}
+
+	if len(cfg.cluster) == 0 {
+		log.Fatal("Missing required parameter: --cluster $node1Id,$node1Address;...;$nodeNId,$nodeNAddress")
+	}
+
+	return cfg
+}
+
+func main() {
+	cfg := getConfig()
+
+	var db sync.Map
+
+	var sm statemachine
+	sm.db = &db
+	sm.server = cfg.index
+
+	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
+	go s.Start()
+
+	hs := httpServer{s, &db}
+
+	http.HandleFunc("/set", hs.setHandler)
+	http.HandleFunc("/get", hs.getHandler)
+	err := http.ListenAndServe(cfg.http, nil)
+	if err != nil {
+		panic(err)
 	}
 }
