@@ -2,6 +2,7 @@ package goraft
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -122,6 +123,20 @@ type Server struct {
 
 type RPCMessage struct {
 	Term uint64
+}
+
+type AppendEntriesRequest struct {
+	RPCMessage
+	LeaderId     uint64
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []Entry
+	LeaderCommit uint64 // tis the leader commit index
+}
+
+type AppendEntriesResponse struct {
+	RPCMessage
+	Success bool
 }
 
 type RequestVoteRequest struct {
@@ -371,6 +386,17 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 }
 
 func (s *Server) heartbeat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timeForHeartbeat := time.Now().After(s.heartbeatTimeout)
+	if timeForHeartbeat {
+		s.heartbeatTimeout = time.Now().Add(time.Duration(s.heartbeatMs) * time.Millisecond)
+		s.debug("Sending heartbeat")
+		s.appendEntries()
+	}
+	// why are we using a channel here? they specifically use a blocking channel and thus that means
+	// that we need something which is you know going to ensure that we dont move ahead without this
 	// TODO
 }
 
@@ -484,4 +510,198 @@ func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	}
 
 	return err == nil
+}
+
+var ErrApplyToLeader = errors.New("Cannot apply message to follower, apply to leader.")
+
+func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
+	s.mu.Lock()
+	if s.state != leaderState {
+		s.mu.Unlock()
+		return nil, ErrApplyToLeader
+	} // this code saus that we cannot use apply with a follower, only the leader is allowed to follow through with Log Replication
+	s.debugf("Processing %d new entry!", len(commands))
+
+	resultChans := make([]chan ApplyResult, len(commands))
+
+	for i, command := range commands {
+		resultChans[i] = make(chan ApplyResult)
+		s.log = append(s.log, Entry{
+			Term:    s.currentTerm,
+			Command: command,
+			result:  resultChans[i],
+		})
+	}
+
+	s.persist()
+
+	s.debug("Waiting to be applied!")
+	s.mu.Unlock()
+
+	s.appendEntries()
+
+	// TODO: What happens if this takes too long?
+	results := make([]ApplyResult, len(commands))
+	var wg sync.WaitGroup
+	wg.Add(len(commands))
+	for i, ch := range resultChans {
+		go func(i int, c chan ApplyResult) {
+			results[i] = <-c
+			wg.Done()
+		}(i, ch)
+	}
+
+	wg.Wait()
+
+	return results, nil
+}
+
+const MAX_APPEND_ENTRIES_BATCH = 8_000
+
+func (s *Server) appendEntries() {
+	for i := range s.cluster {
+		if i == s.clusterIndex {
+			continue
+		}
+
+		go func(i int) {
+			s.mu.Lock()
+
+			next := s.cluster[i].nextIndex
+			prevLogIndex := next - 1
+			prevLogTerm := s.log[prevLogIndex].Term
+
+			var entries []Entry
+
+			if uint64(len(s.log)-1) >= s.cluster[i].nextIndex {
+				s.debugf("len: %d, next: %d, server: %d", len(s.log), next, s.cluster[i].Id)
+				entries = s.log[next:]
+			}
+			// this if function helps us get ready with the entries we want to push,
+
+			if len(entries) > MAX_APPEND_ENTRIES_BATCH {
+				entries = entries[:MAX_APPEND_ENTRIES_BATCH]
+			}
+
+			lenEntries := uint64(len(entries))
+			req := AppendEntriesRequest{
+				RPCMessage: RPCMessage{
+					Term: s.currentTerm,
+				},
+				LeaderId:     s.cluster[s.clusterIndex].Id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: s.commitIndex,
+			}
+
+			s.mu.Unlock()
+
+			var rsp AppendEntriesResponse
+			s.debugf("Sending %d entries to %d for term %d.", len(entries), s.cluster[i].Id, req.Term)
+			ok := s.rpcCall(i, "Server.HandleAppendEntriesRequest", req, &rsp)
+			if !ok {
+				// Will retry next tick
+				return
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.updateTerm(rsp.RPCMessage) {
+				return
+			}
+
+			dropStaleResponse := rsp.Term != req.Term && s.state == leaderState
+			if dropStaleResponse {
+				return
+			}
+
+			if rsp.Success {
+				prev := s.cluster[i].nextIndex
+				s.cluster[i].nextIndex = max(req.PrevLogIndex+lenEntries+1, 1)
+				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
+				s.debugf("Message accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
+			} else {
+				s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
+				s.debugf("Forced to go back to %d for: %d.", s.cluster[i].nextIndex, s.cluster[i].Id)
+			}
+		}(i)
+
+	}
+}
+
+func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.updateTerm(req.RPCMessage)
+
+	if req.Term == s.currentTerm && s.state == candidateState {
+		s.state = followerState
+	}
+
+	rsp.Term = s.currentTerm
+	rsp.Success = false // for now we set it to false, because we dont in anyway unless and until the execution is completed that we
+	// can see true by any chance. This is 100%  going to be false until and unless it isnt set to be true \
+	if s.state != followerState {
+		s.debugf("Non-follower cannot append entries.")
+		return nil
+	}
+
+	if req.Term < s.currentTerm {
+		s.debugf("Dropping request from old leader %d: term %d.", req.LeaderId, req.Term)
+		// Not a valid leader.
+		return nil
+	}
+
+	s.resetElectionTimeout()
+	logLen := uint64(len(s.log))
+	validPreviousLog := req.PrevLogIndex == 0 ||
+		(req.PrevLogIndex < logLen &&
+			s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
+	if !validPreviousLog {
+		s.debug("Not a valid log.")
+		return nil
+	}
+
+	next := req.PrevLogIndex + 1
+	nNewEntries := 0
+
+	for i := next; i < next+uint64(len(req.Entries)); i++ {
+		e := req.Entries[i-next]
+		if i >= uint64(cap(s.log)) {
+			newTotal := next + uint64(len(req.Entries))
+			newLog := make([]Entry, i, newTotal*2)
+			copy(newLog, s.log)
+			s.log = newLog
+		}
+
+		if i < uint64(len(s.log)) && s.log[i].Term != e.Term {
+			prevCap := cap(s.log)
+			// If an existing entry conflicts with a new
+			// one (same index but different terms),
+			// delete the existing entry and all that
+			// follow it (§5.3)
+			s.log = s.log[:i]
+			Server_assert(s, "Capacity remains the same while we truncated.", cap(s.log), prevCap)
+		}
+
+		s.debugf("Appending entry: %s. At index: %d.", string(e.Command), len(s.log))
+
+		if i < uint64(len(s.log)) {
+			Server_assert(s, "Existing log is the same as new log", s.log[i].Term, e.Term)
+		} else {
+			s.log = append(s.log, e)
+			Server_assert(s, "Length is directly related to the index.", uint64(len(s.log)), i+1)
+			nNewEntries++
+		}
+	}
+	if req.LeaderCommit > s.commitIndex {
+		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
+	}
+
+	s.persist()
+
+	rsp.Success = true
+	return nil
 }
