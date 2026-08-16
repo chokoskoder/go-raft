@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -44,7 +45,7 @@ type ClusterMember struct {
 	votedFor uint64
 
 	// TCP connection
-	rpcdlient *rpc.Client
+	rpcClient *rpc.Client
 }
 
 type ServerState string
@@ -117,6 +118,29 @@ type Server struct {
 
 	// Index of this server
 	clusterIndex int
+}
+
+type RPCMessage struct {
+	Term uint64
+}
+
+type RequestVoteRequest struct {
+	RPCMessage
+
+	// candidate requesting vote
+	CandidateId uint64
+
+	// index of candidates last log entry
+	LastLogIndex uint64
+
+	// term of last log
+	LastLogTerm uint64
+}
+
+type RequestVoteResponse struct {
+	RPCMessage
+
+	VoteGranted bool
 }
 
 func NewServer(
@@ -240,8 +264,110 @@ func (s *Server) ensureLog() {
 	}
 }
 
+func (s *Server) timeout() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	hasTimedOut := time.Now().After(s.electionTimeout)
+	if hasTimedOut {
+		s.debug("Timed out, starting new election.")
+		s.state = candidateState
+		s.currentTerm++
+		for i := range s.cluster {
+			if i == s.clusterIndex {
+				s.cluster[i].votedFor = s.id
+			} else {
+				s.cluster[i].votedFor = 0
+			}
+		}
+
+		s.resetElectionTimeout()
+		s.persist()
+		s.requestVote()
+	}
+}
+
 func (s *Server) resetElectionTimeout() {
-	// TODO
+	interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
+	s.debugf("New interval: %s.", interval*time.Millisecond)
+	s.electionTimeout = time.Now().Add(interval * time.Millisecond)
+}
+
+func (s *Server) requestVote() {
+	for i := range s.cluster {
+		if i == s.clusterIndex {
+			continue
+		}
+
+		go func(i int) {
+			s.mu.Lock()
+
+			s.debugf("requesting vote from %d", s.cluster[i].Id)
+
+			lastLogIndex := uint64(len(s.log) - 1)
+			lastLogTerm := s.log[len(s.log)-1].Term
+
+			req := RequestVoteRequest{
+				RPCMessage: RPCMessage{
+					Term: s.currentTerm,
+				},
+				CandidateId:  s.id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			}
+			s.mu.Unlock()
+
+			var rsp RequestVoteResponse
+			ok := s.rpcCall(i, "Server.HandleRequestVoteRequest", req, &rsp)
+
+			if !ok {
+				return
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			if s.updateTerm(rsp.RPCMessage) {
+				return
+			}
+
+			dropStaleResponse := rsp.Term != req.Term
+			if dropStaleResponse {
+				return
+			}
+
+			if rsp.VoteGranted {
+				s.debugf("Vote granted by %d", s.cluster[i].Id)
+				s.cluster[i].votedFor = s.id
+			}
+		}(i)
+	}
+}
+
+func (s *Server) updateTerm(msg RPCMessage) bool {
+	transition := false
+	if msg.Term > s.currentTerm {
+		s.currentTerm = msg.Term
+		s.state = followerState
+		s.setVotedFor(0)
+		transition = true
+		s.debug("transitioned to follow")
+		s.resetElectionTimeout()
+		s.persist()
+	}
+	return transition
+}
+
+func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVoteResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.updateTerm(req.RPCMessage)
+
+	s.debugf("Recieved vote request from %d", req.CandidateId)
+
+	rsp.VoteGranted = false
+	rsp.Term
 }
 
 func (s *Server) heartbeat() {
@@ -252,12 +378,32 @@ func (s *Server) advanceCommitIndex() {
 	// TODO
 }
 
-func (s *Server) timeout() {
-	// TODO
-}
-
 func (s *Server) becomeLeader() {
-	// TODO
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	quorum := len(s.cluster)/2 + 1
+	for i := range s.cluster {
+		if s.cluster[i].votedFor == s.id && quorum > 0 {
+			quorum--
+		}
+	}
+
+	if quorum == 0 {
+		for i := range s.cluster {
+			s.cluster[i].nextIndex = uint64(len(s.log) + 1)
+			s.cluster[i].matchIndex = 0
+		}
+	}
+
+	s.debug("New leader has been appointed and its you")
+	s.state = leaderState
+
+	s.log = append(s.log, Entry{Term: s.currentTerm, Command: nil})
+	// what is command here
+	s.persist()
+
+	s.heartbeatTimeout = time.Now()
 }
 
 func (s *Server) setVotedFor(votedFor uint64) {
@@ -316,4 +462,26 @@ func (s *Server) Start() {
 			}
 		}
 	}()
+}
+
+func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
+	s.mu.Lock()
+	c := s.cluster[i]
+	var err error
+	var rpcClient *rpc.Client = c.rpcClient
+	if c.rpcClient == nil {
+		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
+		rpcClient = c.rpcClient
+	}
+	s.mu.Unlock()
+
+	if err == nil {
+		err = rpcClient.Call(name, req, rsp)
+	}
+
+	if err != nil {
+		s.warnf("Error calling %s on %d: %s.", name, c.Id, err)
+	}
+
+	return err == nil
 }
