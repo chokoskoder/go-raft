@@ -401,7 +401,53 @@ func (s *Server) heartbeat() {
 }
 
 func (s *Server) advanceCommitIndex() {
-	// TODO
+	s.mu.Lock()
+
+	defer s.mu.Unlock()
+
+	// Leader can update commitIndex on quorum.
+	if s.state == leaderState {
+		lastLogIndex := uint64(len(s.log) - 1)
+
+		for i := lastLogIndex; i > s.commitIndex; i-- {
+			quorum := len(s.cluster)/2 + 1
+
+			for j := range s.cluster {
+				if quorum == 0 {
+					break
+				}
+
+				isLeader := j == s.clusterIndex
+				if s.cluster[j].matchIndex >= i || isLeader {
+					quorum--
+				}
+
+			}
+			if quorum == 0 {
+				s.commitIndex = i
+				s.debugf("New commit index: %d.", i)
+				break
+			}
+		}
+	}
+
+	if s.lastApplied <= s.commitIndex {
+
+		log := s.log[s.lastApplied]
+		if len(log.Command) != 0 {
+			s.debugf("Entry applied: %d.", s.lastApplied)
+			// TODO: what if Apply() takes too long?
+			res, err := s.statemachine.Apply(log.Command)
+			if log.result != nil {
+				log.result <- ApplyResult{
+					Result: res,
+					Error:  err,
+				}
+			}
+
+			s.lastApplied++
+		}
+	}
 }
 
 func (s *Server) becomeLeader() {
