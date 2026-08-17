@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	goraft "github.com/chokoskoder/raft"
 )
 
 type statemachine struct {
@@ -128,7 +130,7 @@ func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var results []goraft.ApplyResult
-		results, err := hs.raft.Apply([][]byte{encodeCommand(c)})
+		results, err = hs.raft.Apply([][]byte{encodeCommand(c)})
 		if err == nil {
 			if len(results) != 1 {
 				err = fmt.Errorf("Expected single response from Raft, got: %d.", len(results))
@@ -176,6 +178,8 @@ func getConfig() config {
 			var err error
 			node = os.Args[i+2]
 			cfg.index, err = strconv.Atoi(node)
+			fmt.Println("the cfg index being set is:", cfg.index)
+			fmt.Println("the node index being read is:", node)
 			if err != nil {
 				log.Fatal("Expected $value to be a valid integer in `--node $value`, got: %s", node)
 			}
@@ -232,8 +236,9 @@ func main() {
 	var sm statemachine
 	sm.db = &db
 	sm.server = cfg.index
-
+	fmt.Println("Server index:", cfg.index)
 	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
+
 	go s.Start()
 
 	hs := httpServer{s, &db}

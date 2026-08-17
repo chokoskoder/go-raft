@@ -382,7 +382,41 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 	s.debugf("Recieved vote request from %d", req.CandidateId)
 
 	rsp.VoteGranted = false
-	rsp.Term
+	rsp.Term = s.currentTerm
+
+	if req.Term < s.currentTerm {
+		s.debugf("not granting vote from ClusterMember node id : ")
+	}
+
+	lastLogTerm := s.log[len(s.log)-1].Term
+	logLen := uint64(len(s.log) - 1)
+	logOk := req.LastLogTerm > lastLogTerm ||
+		(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
+	grant := req.Term == s.currentTerm &&
+		logOk &&
+		(s.getVotedFor() == 0 || s.getVotedFor() == req.CandidateId)
+	if grant {
+		s.debugf("Voted for %d.", req.CandidateId)
+		s.setVotedFor(req.CandidateId)
+		rsp.VoteGranted = true
+		s.resetElectionTimeout()
+		s.persist()
+	} else {
+		s.debugf("Not granting vote request from %d.", +req.CandidateId)
+	}
+
+	return nil
+}
+
+func (s *Server) getVotedFor() uint64 {
+	for i := range s.cluster {
+		if i == s.clusterIndex {
+			return s.cluster[i].votedFor
+		}
+	}
+
+	Server_assert(s, "Invalid cluster", true, false)
+	return 0
 }
 
 func (s *Server) heartbeat() {
