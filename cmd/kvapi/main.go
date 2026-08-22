@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	crypto "crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -21,34 +23,15 @@ type statemachine struct {
 
 type commandKind uint8
 
-type command struct {
-	kind  commandKind
-	key   string
-	value string
-}
-
 const (
 	setCommand commandKind = iota
 	getCommand
 )
 
-func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
-	c := decodeCommand(cmd)
-
-	switch c.kind {
-	case setCommand:
-		s.db.Store(c.key, c.value)
-	case getCommand:
-		value, ok := s.db.Load(c.key)
-		if !ok {
-			return nil, fmt.Errorf("Key not found")
-		}
-		return []byte(value.(string)), nil
-	default:
-		return nil, fmt.Errorf("Unknown command: %x", cmd)
-	}
-
-	return nil, nil
+type command struct {
+	kind  commandKind
+	key   string
+	value string
 }
 
 func encodeCommand(c command) []byte {
@@ -79,15 +62,34 @@ func decodeCommand(msg []byte) command {
 	var c command
 	c.kind = commandKind(msg[0])
 
-	keylen := binary.LittleEndian.Uint64(msg[1:9])
-	c.key = string(msg[9 : 9+keylen])
+	keyLen := binary.LittleEndian.Uint64(msg[1:9])
+	c.key = string(msg[9 : 9+keyLen])
 
 	if c.kind == setCommand {
-		valLen := binary.LittleEndian.Uint64(msg[9+keylen : 9+keylen+8])
-		c.value = string(msg[9+keylen+8 : 9+keylen+8+valLen])
+		valLen := binary.LittleEndian.Uint64(msg[9+keyLen : 9+keyLen+8])
+		c.value = string(msg[9+keyLen+8 : 9+keyLen+8+valLen])
 	}
 
 	return c
+}
+
+func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
+	c := decodeCommand(cmd)
+
+	switch c.kind {
+	case setCommand:
+		s.db.Store(c.key, c.value)
+	case getCommand:
+		value, ok := s.db.Load(c.key)
+		if !ok {
+			return nil, fmt.Errorf("Key not found")
+		}
+		return []byte(value.(string)), nil
+	default:
+		return nil, fmt.Errorf("Unknown command: %x", cmd)
+	}
+
+	return nil, nil
 }
 
 type httpServer struct {
@@ -95,6 +97,9 @@ type httpServer struct {
 	db   *sync.Map
 }
 
+// Example:
+//
+//	curl http://localhost:2020/set?key=x&value=1
 func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
 	var c command
 	c.kind = setCommand
@@ -109,11 +114,12 @@ func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getting values from the raft server is where the interesting stuff happens
-// we already embed a local in memory map with which we are working, we could just read from that
-// map in the current process BUT it might not be up to date (when working on a
-// distributed cluster setup) thus we will pass it through the replication logs
-
+// Example:
+//
+//	curl http://localhost:2020/get?key=x
+//	1
+//	curl http://localhost:2020/get?key=x&relaxed=true # Skips consensus for the read.
+//	1
 func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
 	var c command
 	c.kind = getCommand
@@ -124,7 +130,7 @@ func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("relaxed") == "true" {
 		v, ok := hs.db.Load(c.key)
 		if !ok {
-			err = fmt.Errorf("key not found")
+			err = fmt.Errorf("Key not found")
 		} else {
 			value = []byte(v.(string))
 		}
@@ -149,7 +155,6 @@ func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	written := 0
-
 	for written < len(value) {
 		n, err := w.Write(value[written:])
 		if err != nil {
@@ -178,8 +183,6 @@ func getConfig() config {
 			var err error
 			node = os.Args[i+2]
 			cfg.index, err = strconv.Atoi(node)
-			fmt.Println("the cfg index being set is:", cfg.index)
-			fmt.Println("the node index being read is:", node)
 			if err != nil {
 				log.Fatal("Expected $value to be a valid integer in `--node $value`, got: %s", node)
 			}
@@ -229,6 +232,13 @@ func getConfig() config {
 }
 
 func main() {
+	var b [8]byte
+	_, err := crypto.Read(b[:])
+	if err != nil {
+		panic("cannot seed math/rand package with cryptographically secure random number generator")
+	}
+	rand.Seed(int64(binary.LittleEndian.Uint64(b[:])))
+
 	cfg := getConfig()
 
 	var db sync.Map
@@ -236,16 +246,15 @@ func main() {
 	var sm statemachine
 	sm.db = &db
 	sm.server = cfg.index
-	fmt.Println("Server index:", cfg.index)
-	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
 
+	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
 	go s.Start()
 
 	hs := httpServer{s, &db}
 
 	http.HandleFunc("/set", hs.setHandler)
 	http.HandleFunc("/get", hs.getHandler)
-	err := http.ListenAndServe(cfg.http, nil)
+	err = http.ListenAndServe(cfg.http, nil)
 	if err != nil {
 		panic(err)
 	}
