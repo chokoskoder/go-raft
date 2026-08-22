@@ -52,9 +52,9 @@ type ClusterMember struct {
 type ServerState string
 
 const (
-	leaderState    ServerState = "leader"
-	followerState              = "follower"
-	candidateState             = "candidate"
+	leaderState    ServerState = "leaderState"
+	followerState  ServerState = "followerState"
+	candidateState ServerState = "candidateState"
 )
 
 type PersistentState struct {
@@ -175,6 +175,7 @@ func NewServer(
 	return &Server{
 		id:           cluster[clusterIndex].Id,
 		address:      cluster[clusterIndex].Address,
+		cluster:      cluster,
 		statemachine: stateMachine,
 		metadataDir:  metadataDir,
 		clusterIndex: clusterIndex,
@@ -221,9 +222,6 @@ func Server_assert[T comparable](s *Server, msg string, a, b T) {
 }
 
 func (s *Server) persist() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.fd.Truncate(0)
 	s.fd.Seek(0, 0)
 	enc := gob.NewEncoder(s.fd)
@@ -238,7 +236,7 @@ func (s *Server) persist() {
 	if err = s.fd.Sync(); err != nil {
 		panic(err)
 	}
-	s.debug(fmt.Sprintf("Persisted. Term: %d. Log Len: %d. Voted For: %s.", s.currentTerm, len(s.log), s.cluster[s.clusterIndex].votedFor))
+	s.debug(fmt.Sprintf("Persisted. Term: %d. Log Len: %d. Voted For: %d.", s.currentTerm, len(s.log), s.cluster[s.clusterIndex].votedFor))
 }
 
 func (s *Server) restore() {
@@ -295,7 +293,6 @@ func (s *Server) timeout() {
 				s.cluster[i].votedFor = 0
 			}
 		}
-
 		s.resetElectionTimeout()
 		s.persist()
 		s.requestVote()
@@ -321,7 +318,6 @@ func (s *Server) requestVote() {
 
 			lastLogIndex := uint64(len(s.log) - 1)
 			lastLogTerm := s.log[len(s.log)-1].Term
-
 			req := RequestVoteRequest{
 				RPCMessage: RPCMessage{
 					Term: s.currentTerm,
@@ -385,7 +381,8 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 	rsp.Term = s.currentTerm
 
 	if req.Term < s.currentTerm {
-		s.debugf("not granting vote from ClusterMember node id : ")
+		s.debugf("Not granting vote request from %d.", req.CandidateId)
+		return nil
 	}
 
 	lastLogTerm := s.log[len(s.log)-1].Term
@@ -429,14 +426,10 @@ func (s *Server) heartbeat() {
 		s.debug("Sending heartbeat")
 		s.appendEntries()
 	}
-	// why are we using a channel here? they specifically use a blocking channel and thus that means
-	// that we need something which is you know going to ensure that we dont move ahead without this
-	// TODO
 }
 
 func (s *Server) advanceCommitIndex() {
 	s.mu.Lock()
-
 	defer s.mu.Unlock()
 
 	// Leader can update commitIndex on quorum.
@@ -455,7 +448,6 @@ func (s *Server) advanceCommitIndex() {
 				if s.cluster[j].matchIndex >= i || isLeader {
 					quorum--
 				}
-
 			}
 			if quorum == 0 {
 				s.commitIndex = i
@@ -464,9 +456,7 @@ func (s *Server) advanceCommitIndex() {
 			}
 		}
 	}
-
 	if s.lastApplied <= s.commitIndex {
-
 		log := s.log[s.lastApplied]
 		if len(log.Command) != 0 {
 			s.debugf("Entry applied: %d.", s.lastApplied)
@@ -478,38 +468,34 @@ func (s *Server) advanceCommitIndex() {
 					Error:  err,
 				}
 			}
-
-			s.lastApplied++
 		}
+		s.lastApplied++
 	}
 }
 
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	quorum := len(s.cluster)/2 + 1
 	for i := range s.cluster {
 		if s.cluster[i].votedFor == s.id && quorum > 0 {
 			quorum--
 		}
 	}
-
 	if quorum == 0 {
 		for i := range s.cluster {
 			s.cluster[i].nextIndex = uint64(len(s.log) + 1)
 			s.cluster[i].matchIndex = 0
 		}
+
+		s.debug("New leader.")
+		s.state = leaderState
+
+		s.log = append(s.log, Entry{Term: s.currentTerm, Command: nil})
+		s.persist()
+
+		s.heartbeatTimeout = time.Now()
 	}
-
-	s.debug("New leader has been appointed and its you")
-	s.state = leaderState
-
-	s.log = append(s.log, Entry{Term: s.currentTerm, Command: nil})
-	// what is command here
-	s.persist()
-
-	s.heartbeatTimeout = time.Now()
 }
 
 func (s *Server) setVotedFor(votedFor uint64) {
@@ -555,6 +541,7 @@ func (s *Server) Start() {
 			}
 			state := s.state
 			s.mu.Unlock()
+
 			switch state {
 			case leaderState:
 				s.heartbeat()
@@ -574,7 +561,7 @@ func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	s.mu.Lock()
 	c := s.cluster[i]
 	var err error
-	var rpcClient *rpc.Client = c.rpcClient
+	var rpcClient *rpc.Client = s.cluster[i].rpcClient
 	if c.rpcClient == nil {
 		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
 		rpcClient = c.rpcClient
