@@ -1,5 +1,9 @@
 # go-raft
 
+## State Machine
+
+![Raft node state machine](stateMachine.png)
+
 A from-scratch implementation of the [Raft consensus algorithm](https://raft.github.io/) in Go, plus a
 replicated key-value store (`cmd/kvapi`) built on top of it to show the library in use.
 
